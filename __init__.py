@@ -1,5 +1,5 @@
 # ComfyUI-DiaTTS/__init__.py
 
-from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+from .nodes import comfy_entrypoint
 
-__all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
+__all__ = ['comfy_entrypoint']

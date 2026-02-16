@@ -10,6 +10,8 @@ from safetensors.torch import load_file as load_safetensors_file
 import comfy.utils
 import torchaudio # Needed for potential resampling in encode_audio_prompt
 
+from comfy_api.latest import ComfyExtension, io, ui
+
 # --- Import Dia library components ---
 try:
     from .dia_lib.model import Dia, ComputeDtype, DEFAULT_SAMPLE_RATE
@@ -41,29 +43,35 @@ def get_torch_device():
 # --- Global model cache ---
 loaded_dia_objects = {}
 
-class DiaLoader:
+class DiaLoader(io.ComfyNode):
     """Loads the Dia-1.6B TTS model from a local safetensors file."""
+    
     @classmethod
-    def INPUT_TYPES(s):
+    def define_schema(cls) -> io.Schema:
         """Finds .safetensors files in diffusion_models directories."""
         try:
             safetensors_files = folder_paths.get_filename_list("diffusion_models")
-            s.dia_model_files = sorted([f for f in safetensors_files if f.lower().endswith(".safetensors")])
-            if not s.dia_model_files:
-                print("DiaLoader: No .safetensors files found in diffusion_models directories.")
-                s.dia_model_files = ["None"]
+            dia_model_files = sorted([f for f in safetensors_files if f.lower().endswith(".safetensors")])
+            if not dia_model_files:
+                dia_model_files = ["None"]
         except Exception as e:
             print(f"DiaLoader: Warning - Could not access diffusion_models paths: {e}")
-            s.dia_model_files = ["None"]
+            dia_model_files = ["None"]
 
-        return { "required": { "ckpt_name": (s.dia_model_files,), }, }
+        return io.Schema(
+            node_id="DiaLoader",
+            display_name="Dia 1.6b Loader",
+            category="audio/DiaTTS",
+            inputs=[
+                io.Combo.Input("ckpt_name", options=dia_model_files)
+            ],
+            outputs=[
+                io.Custom("DIA_MODEL").Output(display_name="dia_model")
+            ]
+        )
 
-    RETURN_TYPES = ("DIA_MODEL",)
-    RETURN_NAMES = ("dia_model",)
-    FUNCTION = "load_dia_model"
-    CATEGORY = "audio/DiaTTS"
-
-    def load_dia_model(self, ckpt_name: str):
+    @classmethod
+    def execute(cls, ckpt_name: str) -> io.NodeOutput:
         """Loads the safetensors weights, combines with embedded config, loads DAC, and prepares the Dia object."""
         global loaded_dia_objects
 
@@ -154,41 +162,38 @@ class DiaLoader:
             print(f"DiaLoader: Caching loaded Dia object.")
             loaded_dia_objects[current_key] = dia_object
 
-        return (dia_object,)
+        return io.NodeOutput(dia_object)
 
 
-class DiaGenerate:
+class DiaGenerate(io.ComfyNode):
     """Generates audio using a pre-loaded Dia TTS model, optionally with an audio prompt."""
+    
     @classmethod
-    def INPUT_TYPES(s):
-        """Defines the inputs for audio generation."""
-        return {
-            "required": {
-                "dia_model": ("DIA_MODEL",),
-                "text": ("STRING", {
-                    "multiline": True,
-                    "dynamicPrompts": False,
-                    "default": ""
-                }),
-                "max_tokens": ("INT", {"default": 1720, "min": 860, "max": 3072, "step": 10}),
-                "cfg_scale": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 7.0, "step": 0.1}),
-                "temperature": ("FLOAT", {"default": 1.3, "min": 0.1, "max": 1.5, "step": 0.05}),
-                "top_p": ("FLOAT", {"default": 0.95, "min": 0.1, "max": 1.0, "step": 0.01}),
-                "cfg_filter_top_k": ("INT", {"default": 32, "min": 1, "max": 100, "step": 1}),
-                "speed_factor": ("FLOAT", {"default": 0.94, "min": 0.5, "max": 1.5, "step": 0.01}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-            },
-             "optional": {
-                "audio_prompt": ("AUDIO",), # Optional audio prompt input
-             }
-        }
+    def define_schema(cls) -> io.Schema:
+        """Defines the inputs and outputs for audio generation."""
+        return io.Schema(
+            node_id="DiaGenerate",
+            display_name="Dia TTS Generate",
+            category="audio/DiaTTS",
+            inputs=[
+                io.Custom("DIA_MODEL").Input("dia_model"),
+                io.String.Input("text", multiline=True, default=""),
+                io.Int.Input("max_tokens", default=1720, min=860, max=3072, step=10),
+                io.Float.Input("cfg_scale", default=3.0, min=1.0, max=7.0, step=0.1),
+                io.Float.Input("temperature", default=1.3, min=0.1, max=1.5, step=0.05),
+                io.Float.Input("top_p", default=0.95, min=0.1, max=1.0, step=0.01),
+                io.Int.Input("cfg_filter_top_k", default=32, min=1, max=100, step=1),
+                io.Float.Input("speed_factor", default=0.94, min=0.5, max=1.5, step=0.01),
+                io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff),
+                io.Custom("AUDIO").Input("audio_prompt", optional=True)
+            ],
+            outputs=[
+                io.Custom("AUDIO").Output(display_name="audio")
+            ]
+        )
 
-    RETURN_TYPES = ("AUDIO",)
-    RETURN_NAMES = ("audio",)
-    FUNCTION = "generate_audio"
-    CATEGORY = "audio/DiaTTS"
-
-    def generate_audio(self, dia_model: Dia, text: str, max_tokens: int, cfg_scale: float, temperature: float, top_p: float, cfg_filter_top_k: int, speed_factor: float, seed: int, audio_prompt=None):
+    @classmethod
+    def execute(cls, dia_model: Dia, text: str, max_tokens: int, cfg_scale: float, temperature: float, top_p: float, cfg_filter_top_k: int, speed_factor: float, seed: int, audio_prompt=None) -> io.NodeOutput:
         """
         Performs TTS generation. If audio_prompt is provided, the 'text' input
         should contain the transcript of the audio_prompt followed by the text to generate.
@@ -277,7 +282,7 @@ class DiaGenerate:
             if output_np is None or output_np.size == 0:
                 print("DiaGenerate: Warning - Generation returned empty. Outputting silence.")
                 silent_tensor = torch.zeros((1, 1, DEFAULT_SAMPLE_RATE), dtype=torch.float32) # Shape [1, 1, T]
-                return ({'waveform': silent_tensor, 'sample_rate': DEFAULT_SAMPLE_RATE},)
+                return io.NodeOutput({'waveform': silent_tensor, 'sample_rate': DEFAULT_SAMPLE_RATE})
 
             # --- Speed Factor Adjustment ---
             if speed_factor != 1.0:
@@ -320,7 +325,7 @@ class DiaGenerate:
                     raise ValueError(f"Final tensor has a zero dimension: {output_tensor.shape}")
 
                 result = {'waveform': output_tensor, 'sample_rate': DEFAULT_SAMPLE_RATE}
-                return (result,)
+                return io.NodeOutput(result)
             except Exception as format_e:
                 print(f"DiaGenerate: Error formatting output: {format_e}")
                 traceback.print_exc()
@@ -337,13 +342,9 @@ class DiaGenerate:
                 torch.cuda.empty_cache()
 
 
-# --- Node Mappings ---
-NODE_CLASS_MAPPINGS = {
-    "DiaLoader": DiaLoader,
-    "DiaGenerate": DiaGenerate,
-}
+class DiaExtension(ComfyExtension):
+    async def get_node_list(self) -> list[type[io.ComfyNode]]:
+        return [DiaLoader, DiaGenerate]
 
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "DiaLoader": "Dia 1.6b Loader",
-    "DiaGenerate": "Dia TTS Generate",
-}
+async def comfy_entrypoint() -> DiaExtension:
+    return DiaExtension()
